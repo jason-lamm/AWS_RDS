@@ -9,7 +9,7 @@
 
 Run the following PowerShell commands to generate hex strings from your certificate and key files:
 
-```powershell
+###powershell
 $certPath = "C:\TDE\MyTDECert.cer"
 $keyPath  = "C:\TDE\MyTDECert.key"
 
@@ -18,7 +18,17 @@ $keyHex  = (Get-Content $keyPath -Encoding Byte | ForEach-Object ToString X2) -j
 
 "Cert HEX length: $($certHex.Length)"
 "Key HEX length: $($keyHex.Length)"
-```
+
+Write-Host "----- CERTIFICATE HEX START -----"
+Write-Host $certHex
+Write-Host "----- CERTIFICATE HEX END -----"
+
+Write-Host "----- PRIVATE KEY HEX START -----"
+Write-Host $keyHex
+Write-Host "----- PRIVATE KEY HEX END -----"
+
+#####
+
 
 This produces two long hexadecimal strings you will embed in your SQL command.
 
