@@ -1,0 +1,79 @@
+## Importing a TDE Certificate into AWS RDS for SQL Server (BYOK)
+
+### 1. Download Certificate Files from S3
+
+* Locate your `.cer` and `.key` files in your S3 bucket (e.g., `sql-tde-certificates-keys`).
+* Download them to a secure local path such as `C:\TDE\MyTDECert.cer` and `C:\TDE\MyTDECert.key`.
+
+### 2. Convert Files to Hexadecimal
+
+Run the following PowerShell commands to generate hex strings from your certificate and key files:
+
+```powershell
+$certPath = "C:\TDE\MyTDECert.cer"
+$keyPath  = "C:\TDE\MyTDECert.key"
+
+$certHex = (Get-Content $certPath -Encoding Byte | ForEach-Object ToString X2) -join ''
+$keyHex  = (Get-Content $keyPath -Encoding Byte | ForEach-Object ToString X2) -join ''
+
+"Cert HEX length: $($certHex.Length)"
+"Key HEX length: $($keyHex.Length)"
+```
+
+This produces two long hexadecimal strings you will embed in your SQL command.
+
+### 3. Connect to Your RDS SQL Instance
+
+* Open SQL Server Management Studio (SSMS).
+* Connect to your RDS endpoint (e.g., `myrds.abc123.us-east-1.rds.amazonaws.com`).
+* Use the `master` database for the import.
+
+### 4. Import the Certificate
+
+Run this SQL command (replace with your hex strings and password):
+
+```sql
+EXEC msdb.dbo.rds_import_tde_certificate
+    @certificate_name = 'MyTDECert',
+    @certificate_data = 0x308203123456789ABCDEF...,  -- from .cer
+    @private_key_data = 0x308203123456789ABCDEF...,  -- from .key
+    @private_key_pwd  = 'StrongPasswordHere';
+```
+
+You should receive a confirmation message:
+
+> The TDE certificate was successfully imported.
+
+### 5. Verify Import
+
+Run the following query to confirm that your certificate was imported successfully:
+
+```sql
+SELECT name, subject, pvt_key_encryption_type_desc
+FROM sys.certificates;
+```
+
+You should see your imported certificate listed.
+
+### 6. Enable TDE for a Database
+
+Once the certificate is imported, use it to encrypt your databases:
+
+```sql
+USE YourDatabase;
+CREATE DATABASE ENCRYPTION KEY
+    WITH ALGORITHM = AES_256
+    ENCRYPTION BY SERVER CERTIFICATE MyTDECert;
+ALTER DATABASE YourDatabase SET ENCRYPTION ON;
+```
+
+### 7. Best Practices
+
+* Keep your original `.cer` and `.key` files stored securely in your **S3 bucket** with **KMS encryption**.
+* Store the certificate password in **AWS Secrets Manager**.
+* Record metadata such as import date, certificate name, and associated databases.
+
+---
+
+**Summary:**
+You cannot import directly from S3. Instead, download the files, convert to hex, and use `rds_import_tde_certificate` to load them into RDS via T-SQL.
