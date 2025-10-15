@@ -43,6 +43,7 @@ This produces two long hexadecimal strings you will embed in your SQL command.
 Run this SQL command (replace with your hex strings and password):
 
 ---sql
+---Be sure to add 0x in front
 EXEC msdb.dbo.rds_import_tde_certificate
     @certificate_name = 'MyTDECert',
     @certificate_data = 0x308203123456789ABCDEF...,  -- from .cer
