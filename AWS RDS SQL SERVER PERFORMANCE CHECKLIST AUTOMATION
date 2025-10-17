@@ -1,0 +1,209 @@
+<#
+=====================================================================================
+AWS RDS SQL SERVER PERFORMANCE CHECKLIST AUTOMATION
+Author: ChatGPT
+=====================================================================================
+
+DESCRIPTION:
+This PowerShell script connects to an AWS RDS SQL Server instance, executes performance 
+diagnostic queries, and exports the results into CSV reports. 
+It provides a quick performance baseline and optimization insight.
+
+SAFE TO RUN: 
+This script is read-only — no configuration changes are made.
+
+=====================================================================================
+HOW TO USE:
+1. Make sure the SqlServer PowerShell module is installed:
+       Install-Module SqlServer -Force
+
+2. Save this script as:
+       RDS_SQL_PerfCheck.ps1
+
+3. Edit the configuration block below:
+       - Enter your RDS endpoint, login, password, and output folder path.
+
+4. Run in PowerShell (preferably as Administrator):
+       .\RDS_SQL_PerfCheck.ps1
+
+5. The script creates a timestamped folder (e.g., C:\RDS_SQL_PerfReports\2025-10-17_0900)
+   containing these files:
+       01_Instance_Memory_Config.csv
+       02_TempDB_Config.csv
+       03_Index_Fragmentation.csv
+       04A_Missing_Indexes.csv
+       04B_Unused_Indexes.csv
+       05_WaitStats_IO.csv
+
+6. Review recommendations printed in the summary at the end.
+
+=====================================================================================
+#>
+
+# --- CONFIGURATION SECTION ------------------------------------------------------------
+
+$ServerInstance = "your-rds-endpoint.rds.amazonaws.com"   # e.g. myrdsinstance.c3abcd123.us-east-1.rds.amazonaws.com
+$Database = "master"
+$Username = "your_sql_login"
+$Password = "your_password"
+$BaseOutputPath = "C:\RDS_SQL_PerfReports"
+
+# -------------------------------------------------------------------------------------
+
+# Create timestamped subfolder for historical baselines
+$Timestamp = Get-Date -Format "yyyy-MM-dd_HHmm"
+$OutputPath = Join-Path $BaseOutputPath $Timestamp
+
+if (!(Test-Path $OutputPath)) {
+    New-Item -ItemType Directory -Path $OutputPath | Out-Null
+}
+
+# Build SQL credential
+$SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+$SqlCredential = New-Object System.Management.Automation.PSCredential($Username, $SecurePassword)
+
+Write-Host "================================================================="
+Write-Host "  AWS RDS SQL SERVER PERFORMANCE CHECKLIST AUTOMATION"
+Write-Host "================================================================="
+Write-Host "Connecting to RDS instance: $ServerInstance"
+Write-Host "Output folder: $OutputPath"
+Write-Host "-----------------------------------------------------------------`n"
+
+# --- SECTION 1: Instance & Memory Config ---------------------------------------------
+$query1 = @"
+SELECT 
+    SERVERPROPERTY('MachineName') AS ServerName,
+    SERVERPROPERTY('Edition') AS Edition,
+    SERVERPROPERTY('ProductVersion') AS Version,
+    SERVERPROPERTY('EngineEdition') AS EngineEdition,
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'max server memory (MB)') AS MaxServerMemory_MB,
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'min server memory (MB)') AS MinServerMemory_MB,
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'cost threshold for parallelism') AS CostThreshold,
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'max degree of parallelism') AS MaxDOP,
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'optimize for ad hoc workloads') AS OptimizeAdHoc,
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'remote admin connections') AS RemoteDACEnabled;
+"@
+
+Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database -Credential $SqlCredential -Query $query1 |
+    Export-Csv "$OutputPath\01_Instance_Memory_Config.csv" -NoTypeInformation
+Write-Host "✓ Section 1 completed — Instance & Memory Config exported."
+
+# --- SECTION 2: TempDB Configuration --------------------------------------------------
+$query2 = @"
+USE tempdb;
+SELECT 
+    name AS FileName,
+    type_desc,
+    size/128 AS SizeMB,
+    growth/128 AS GrowthMB,
+    physical_name
+FROM sys.database_files;
+"@
+
+Invoke-Sqlcmd -ServerInstance $ServerInstance -Database "tempdb" -Credential $SqlCredential -Query $query2 |
+    Export-Csv "$OutputPath\02_TempDB_Config.csv" -NoTypeInformation
+Write-Host "✓ Section 2 completed — TempDB Config exported."
+
+# --- SECTION 3: Index Fragmentation ---------------------------------------------------
+$query3 = @"
+SELECT 
+    DB_NAME() AS DatabaseName,
+    OBJECT_NAME(ips.object_id) AS TableName,
+    i.name AS IndexName,
+    ips.avg_fragmentation_in_percent AS FragPct,
+    ips.page_count AS PageCount
+FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'LIMITED') AS ips
+JOIN sys.indexes AS i
+    ON ips.object_id = i.object_id AND ips.index_id = i.index_id
+WHERE ips.avg_fragmentation_in_percent > 10 AND ips.page_count > 100
+ORDER BY ips.avg_fragmentation_in_percent DESC;
+"@
+
+Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database -Credential $SqlCredential -Query $query3 |
+    Export-Csv "$OutputPath\03_Index_Fragmentation.csv" -NoTypeInformation
+Write-Host "✓ Section 3 completed — Index Fragmentation exported."
+
+# --- SECTION 4A: Missing Indexes ------------------------------------------------------
+$query4a = @"
+SELECT 
+    DB_NAME(mid.database_id) AS DatabaseName,
+    OBJECT_NAME(mid.object_id, mid.database_id) AS TableName,
+    migs.user_seeks, migs.user_scans,
+    mid.equality_columns, mid.inequality_columns, mid.included_columns
+FROM sys.dm_db_missing_index_group_stats AS migs
+JOIN sys.dm_db_missing_index_groups AS mig
+    ON migs.group_handle = mig.index_group_handle
+JOIN sys.dm_db_missing_index_details AS mid
+    ON mig.index_handle = mid.index_handle
+ORDER BY migs.user_seeks DESC;
+"@
+
+Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database -Credential $SqlCredential -Query $query4a |
+    Export-Csv "$OutputPath\04A_Missing_Indexes.csv" -NoTypeInformation
+
+# --- SECTION 4B: Unused Indexes -------------------------------------------------------
+$query4b = @"
+SELECT 
+    DB_NAME() AS DatabaseName,
+    OBJECT_NAME(i.object_id) AS TableName,
+    i.name AS IndexName,
+    user_seeks, user_scans, user_lookups, user_updates
+FROM sys.dm_db_index_usage_stats AS s
+JOIN sys.indexes AS i
+    ON s.object_id = i.object_id AND s.index_id = i.index_id
+WHERE OBJECTPROPERTY(i.object_id,'IsUserTable') = 1
+ORDER BY user_updates DESC;
+"@
+
+Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database -Credential $SqlCredential -Query $query4b |
+    Export-Csv "$OutputPath\04B_Unused_Indexes.csv" -NoTypeInformation
+Write-Host "✓ Section 4 completed — Missing & Unused Indexes exported."
+
+# --- SECTION 5: Wait Stats & I/O Latency ---------------------------------------------
+$query5 = @"
+-- Wait type summary (top 10 waits)
+SELECT TOP 10 
+    wait_type, 
+    wait_time_ms/1000.0 AS WaitTimeSec,
+    signal_wait_time_ms/1000.0 AS SignalWaitSec,
+    waiting_tasks_count AS WaitCount
+FROM sys.dm_os_wait_stats
+WHERE wait_type NOT IN (
+    'SLEEP_TASK','BROKER_TASK_STOP','SQLTRACE_BUFFER_FLUSH',
+    'XE_TIMER_EVENT','XE_DISPATCHER_WAIT'
+)
+ORDER BY wait_time_ms DESC;
+
+-- I/O latency baseline
+SELECT 
+    DB_NAME(vfs.database_id) AS DatabaseName,
+    mf.physical_name,
+    vfs.num_of_reads, vfs.num_of_writes,
+    vfs.io_stall_read_ms, vfs.io_stall_write_ms,
+    CAST((1.0 * vfs.io_stall_read_ms / NULLIF(vfs.num_of_reads,0)) AS DECIMAL(10,2)) AS AvgReadLatency_ms,
+    CAST((1.0 * vfs.io_stall_write_ms / NULLIF(vfs.num_of_writes,0)) AS DECIMAL(10,2)) AS AvgWriteLatency_ms
+FROM sys.dm_io_virtual_file_stats(NULL,NULL) AS vfs
+JOIN sys.master_files AS mf
+    ON vfs.database_id = mf.database_id AND vfs.file_id = mf.file_id
+ORDER BY AvgReadLatency_ms DESC;
+"@
+
+Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database -Credential $SqlCredential -Query $query5 |
+    Export-Csv "$OutputPath\05_WaitStats_IO.csv" -NoTypeInformation
+Write-Host "✓ Section 5 completed — Wait Stats & I/O exported."
+
+# --- FINAL SUMMARY -------------------------------------------------------------------
+Write-Host "`n================================================================="
+Write-Host "All performance data exported successfully!"
+Write-Host "Folder: $OutputPath"
+Write-Host "=================================================================`n"
+
+Get-ChildItem $OutputPath | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
+
+Write-Host "`nNEXT STEPS:"
+Write-Host " - Review AvgReadLatency/AvgWriteLatency (goal < 5–10 ms)"
+Write-Host " - Rebuild/reorganize fragmented indexes"
+Write-Host " - Review missing/unused indexes for optimization"
+Write-Host " - Tune MAXDOP, Cost Threshold, and memory settings"
+Write-Host " - Keep each timestamped folder for trending analysis over time."
+Write-Host "`nDone ✅"
