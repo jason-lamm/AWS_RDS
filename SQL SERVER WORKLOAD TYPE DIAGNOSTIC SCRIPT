@@ -1,0 +1,184 @@
+/******************************************************************************************
+   SQL SERVER WORKLOAD TYPE DIAGNOSTIC SCRIPT
+   Purpose : Helps determine if your workload behaves like OLTP, Mixed, or OLAP
+   Author  : ChatGPT
+   Safe to run: ✅ (Read-only)
+******************************************************************************************/
+
+/******************************************************************************************
+ STEP 1 — ANALYZE QUERY PATTERNS
+******************************************************************************************/
+PRINT 'STEP 1 — Query Duration and Execution Patterns';
+
+SELECT 
+    DB_NAME(st.dbid) AS DatabaseName,
+    COUNT(*) AS QueryCount,
+    AVG(total_elapsed_time / execution_count) / 1000 AS AvgElapsedMs,
+    AVG(total_worker_time / execution_count) / 1000 AS AvgCPUms,
+    AVG(total_logical_reads / execution_count) AS AvgLogicalReads,
+    SUM(execution_count) AS TotalExecutions
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+WHERE st.dbid IS NOT NULL
+GROUP BY DB_NAME(st.dbid)
+ORDER BY AvgElapsedMs DESC;
+
+/*
+INTERPRETATION:
+ 🟢 OLTP: High TotalExecutions, low AvgElapsedMs (<50–100ms)
+ 🟡 Mixed: Mix of frequent short and some long-running queries
+ 🔵 OLAP: Few queries with very high AvgElapsedMs (>500ms)
+*/
+
+
+/******************************************************************************************
+ STEP 2 — CHECK TOP WAIT TYPES
+******************************************************************************************/
+PRINT 'STEP 2 — Wait Type Analysis';
+
+SELECT TOP 10 
+    wait_type, 
+    wait_time_ms/1000.0 AS WaitTimeSec,
+    waiting_tasks_count,
+    wait_time_ms/NULLIF(waiting_tasks_count,0) AS AvgWaitMs
+FROM sys.dm_os_wait_stats
+WHERE wait_type NOT IN (
+    'SLEEP_TASK','BROKER_TASK_STOP','SQLTRACE_BUFFER_FLUSH',
+    'XE_TIMER_EVENT','XE_DISPATCHER_WAIT'
+)
+ORDER BY wait_time_ms DESC;
+
+/*
+INTERPRETATION:
+ - PAGEIOLATCH_* → Many small reads (OLTP)
+ - CXPACKET/CXCONSUMER → Parallel queries (Mixed/OLAP)
+ - LCK_* → High lock contention (OLTP)
+ - ASYNC_NETWORK_IO → Large result sets (OLAP)
+*/
+
+
+/******************************************************************************************
+ STEP 3 — LOOK AT QUERY EXECUTION COUNTS VS DURATION
+******************************************************************************************/
+PRINT 'STEP 3 — Top Queries by Average Duration';
+
+SELECT TOP 20
+    DB_NAME(st.dbid) AS DatabaseName,
+    SUBSTRING(st.text, 1, 100) AS SampleQueryText,
+    qs.execution_count,
+    (qs.total_elapsed_time / qs.execution_count) / 1000 AS AvgElapsedMs,
+    (qs.total_logical_reads / qs.execution_count) AS AvgReads
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+WHERE st.dbid IS NOT NULL
+ORDER BY AvgElapsedMs DESC;
+
+/*
+INTERPRETATION:
+ - OLTP: High execution_count, low AvgElapsedMs
+ - Mixed: Variety of both short and long queries
+ - OLAP: Few queries, very high AvgElapsedMs and AvgReads
+*/
+
+
+/******************************************************************************************
+ STEP 4 — AVERAGE READS PER QUERY
+******************************************************************************************/
+PRINT 'STEP 4 — Average Reads per Query';
+
+SELECT 
+    AVG(total_logical_reads / execution_count) AS AvgReadsPerExec,
+    AVG(total_physical_reads / execution_count) AS AvgPhysicalReadsPerExec
+FROM sys.dm_exec_query_stats;
+
+/*
+INTERPRETATION:
+ - <100 reads  → OLTP (index seeks)
+ - 100–10,000 → Mixed workload
+ - >10,000    → OLAP (scans, aggregates, joins)
+*/
+
+
+/******************************************************************************************
+ STEP 5 — TRANSACTION VS CPU RATIO (I/O vs. CPU)
+******************************************************************************************/
+PRINT 'STEP 5 — I/O vs. CPU Ratio';
+
+SELECT 
+    SUM(num_of_writes) AS TotalWrites,
+    SUM(num_of_reads) AS TotalReads,
+    SUM(io_stall_read_ms) AS ReadStallMs,
+    SUM(io_stall_write_ms) AS WriteStallMs
+FROM sys.dm_io_virtual_file_stats(NULL, NULL);
+
+SELECT 
+    total_cpu_usage_ms = SUM(total_worker_time)/1000
+FROM sys.dm_exec_query_stats;
+
+/*
+INTERPRETATION:
+ - CPU much greater than I/O → OLAP or Mixed (analytical)
+ - I/O much greater than CPU → OLTP (many small transactions)
+*/
+
+
+/******************************************************************************************
+ STEP 6 — PARALLELISM (Degree of Parallelism per Query)
+******************************************************************************************/
+PRINT 'STEP 6 — Query Parallelism Overview';
+
+SELECT TOP 20 
+    DB_NAME(st.dbid) AS DatabaseName,
+    qs.execution_count,
+    qs.max_dop AS DegreeOfParallelism,
+    (qs.total_elapsed_time / qs.execution_count) / 1000 AS AvgElapsedMs,
+    SUBSTRING(st.text, 1, 120) AS QueryText
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+WHERE qs.max_dop > 1
+ORDER BY AvgElapsedMs DESC;
+
+/*
+INTERPRETATION:
+ - Most queries with MAXDOP = 1 → OLTP
+ - Mix of MAXDOP > 1 and 1 → Mixed
+ - Majority parallel (MAXDOP > 1) → OLAP
+*/
+
+
+/******************************************************************************************
+ STEP 7 — QUICK SUMMARY METRIC (ONE-LINER SNAPSHOT)
+******************************************************************************************/
+PRINT 'STEP 7 — Summary Snapshot';
+
+SELECT 
+    COUNT(*) AS TotalQueries,
+    SUM(execution_count) AS TotalExecutions,
+    AVG(total_elapsed_time / execution_count) / 1000 AS AvgQueryMs
+FROM sys.dm_exec_query_stats;
+
+/*
+INTERPRETATION:
+ - AvgQueryMs < 100  → OLTP
+ - 100–500           → Mixed
+ - >500              → OLAP
+*/
+
+
+/******************************************************************************************
+ FINAL SUMMARY: WHAT TO DO NEXT
+******************************************************************************************
+ | Metric | OLTP | Mixed | OLAP |
+ |--------|------|-------|------|
+ | Avg Query Duration | <100 ms | 100–500 ms | >500 ms |
+ | Execution Count | Very high | Moderate | Low |
+ | Logical Reads | Low | Moderate | High |
+ | Wait Types | LCK, PAGEIOLATCH | CXPACKET + I/O mix | CXPACKET, ASYNC_NETWORK_IO |
+ | Parallel Plans | Rare | Some | Frequent |
+
+NEXT STEPS:
+ - Collect results at peak workload times.
+ - Observe whether your system leans toward OLTP (many small requests),
+   Mixed (OLTP + reporting), or OLAP (long analytical queries).
+ - Tune MAXDOP and Cost Threshold for Parallelism accordingly.
+******************************************************************************************/
